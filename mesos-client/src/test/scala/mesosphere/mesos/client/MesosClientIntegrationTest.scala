@@ -37,9 +37,9 @@ class MesosClientIntegrationTest extends AkkaUnitTest
 
     And("connection context should be initialized")
     inside(f.client.contextPromise.future.futureValue) {
-      case ConnectionContext(host, port, mesosStreamId, frameworkId) =>
-        host shouldBe f.conf.mesosMasterHost
-        port shouldBe f.conf.mesosMasterPort
+      case MesosConnectionContext(url, mesosStreamId, frameworkId) =>
+        url.getHost shouldBe f.mesosHost
+        url.getPort shouldBe f.mesosPort
         mesosStreamId shouldBe defined
         frameworkId shouldBe defined
     }
@@ -61,9 +61,9 @@ class MesosClientIntegrationTest extends AkkaUnitTest
 
       And("connection context should be initialized")
       inside(f.client.contextPromise.future.futureValue) {
-        case ConnectionContext(host, port, mesosStreamId, frameworkId) =>
-          host shouldBe f.conf.mesosMasterHost
-          port shouldBe f.conf.mesosMasterPort
+        case MesosConnectionContext(url, mesosStreamId, frameworkId) =>
+          url.getHost shouldBe f.mesosHost
+          url.getPort shouldBe f.mesosPort
           mesosStreamId shouldBe defined
           frameworkId shouldBe Some(frameworkID)
       }
@@ -138,6 +138,8 @@ class MesosClientIntegrationTest extends AkkaUnitTest
     )
 
     val mesosUrl = new java.net.URI(mesos.url)
+    val mesosHost = mesosUrl.getHost
+    val mesosPort = mesosUrl.getPort
 
     val conf = new MesosConf(List("--master", s"${mesosUrl.getHost}:${mesosUrl.getPort}"))
     val client = new MesosClient(conf, frameworkInfo)

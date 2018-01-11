@@ -41,8 +41,4 @@ class MesosConf(args: Seq[String]) extends ScallopConf(args) {
   )
 
   verify()
-
-  private val mesosMasterUri: java.net.URI = new java.net.URI(s"my://${mesosMaster()}")
-  val mesosMasterHost: String = mesosMasterUri.getHost()
-  val mesosMasterPort: Int = mesosMasterUri.getPort()
 }

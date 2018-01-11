@@ -33,8 +33,8 @@ class MesosClient(
 
   private val overflowStrategy = akka.stream.OverflowStrategy.backpressure
 
-  val context = new AtomicReference[ConnectionContext](ConnectionContext(conf))
-  val contextPromise = Promise[ConnectionContext]()
+  val context = new AtomicReference[MesosConnectionContext](MesosConnectionContext(conf))
+  val contextPromise = Promise[MesosConnectionContext]()
 
   /**
     Mesos source is an akka-stream `Source[Event, NotUsed]` that frameworks can attach to, to receive mesos event.
@@ -48,7 +48,7 @@ class MesosClient(
           v
      ------------
     | Connection | (2)
-    | Handler    |     -> updates connection context
+    | Handler    |     -> updates connection context with mesos streamId
      ------------
           |
           v
@@ -71,7 +71,7 @@ class MesosClient(
           |
           v
      --------------
-    | Subscribed   | (6)  -> updates connection context
+    | Subscribed   | (6)  -> updates connection context with frameworkId
     | Handler      |
      --------------
           |
@@ -101,7 +101,7 @@ class MesosClient(
        [scalapb](https://scalapb.github.io/) library to parse the extracted RecordIO frame from the previous stage into a mesos
        [Event](https://github.com/apache/mesos/blob/master/include/mesos/scheduler/scheduler.proto#L36)
     6. Subscribed Handler parses the `SUBSCRIBED` event and updates the connection context with the returned `frameworkId`.
-    7. BroadcastHub ad the end the flow is going through a broadcast hub. This allows for a dynamic "fan-out" streaming of events and avoids
+    7. BroadcastHub at the end the flow is going through a broadcast hub. This allows for a dynamic "fan-out" streaming of events and avoids
        making multiple upstream connections to mesos when the source is materialized by multiple event consumers.
 
     Note: _Connection Handler_ updates the _connection context_ object with current mesos leader `host` and `port` along with `Mesos-Stream-Id`
@@ -137,14 +137,14 @@ class MesosClient(
 
           // At this point we successfully connected to mesos leader so context should have correct leader's host
           // and port either from the config or set on the redirect.
-          context.updateAndGet(c => c.copy(mesosStreamId = Some(streamId.value())))
+          context.updateAndGet(c => c.copy(streamId = Some(streamId.value())))
           response
         case StatusCodes.TemporaryRedirect =>
           val leader = new URI(response.header[headers.Location].get.value())
           logger.warn(s"New mesos leader available at $leader")
           // Update the context with the new leader's host and port and throw an exception that is handled in the
           // next `recoverWith` stage.
-          context.updateAndGet(c => c.copy(host = leader.getHost, port = leader.getPort))
+          context.updateAndGet(c => c.copy(url = leader))
           throw new MesosRedicrectException(leader)
         case _ =>
           throw new IllegalArgumentException(s"Mesos server error: $response")
@@ -203,7 +203,7 @@ class MesosClient(
           v
      ------------
     | Call       |
-    | Enhancer   | (2)
+    | Enhancer   | (2)  <-- reads frameworkId from connection context
      ------------
           |
           v
@@ -215,7 +215,7 @@ class MesosClient(
           v
      ------------
     | Request    |
-    | Builder    | (4)
+    | Builder    | (4)  <-- reads mesosStreamId and mesos url from connection context
      ------------
           |
           v
@@ -232,35 +232,34 @@ class MesosClient(
     Note: Merge hub will wait for the _connection context_ object to be fully initialized first meaning that we have current leader's
     `host`, `port` and `Mesos-Stream-Id` to send the events to.
     */
-  private val sink: Sink[(ConnectionContext, HttpRequest), Future[Done]] = Sink.foreach[(ConnectionContext, HttpRequest)]{
-    case (_, request) =>
+  private val sink: Sink[HttpRequest, Future[Done]] = Sink.foreach[HttpRequest] { request =>
       Http().singleRequest(request).map { response =>
           logger.info(s"Response: $response")
           response.discardEntityBytes()
     }
   }
 
-  private val eventSerializer: Flow[(ConnectionContext, Call), (ConnectionContext, Array[Byte]), NotUsed] = Flow[(ConnectionContext, Call)]
-    .map { case (ctx, call) => (ctx, call.toByteArray) }
+  private val eventSerializer: Flow[Call, Array[Byte], NotUsed] = Flow[Call]
+    .map(call => call.toByteArray)
 
-  private val requestBuilder: Flow[(ConnectionContext, Array[Byte]), (ConnectionContext, HttpRequest), NotUsed] = Flow[(ConnectionContext, Array[Byte])]
-    .map { case (ctx, bytes) => (ctx, HttpRequest(
+  private val requestBuilder: Flow[Array[Byte], HttpRequest, NotUsed] = Flow[Array[Byte]]
+    .map(bytes => HttpRequest(
                                         HttpMethods.POST,
-                                        uri = Uri(s"http://${ctx.url}/api/v1/scheduler"),
+                                        uri = Uri(s"${context.get().url}/api/v1/scheduler"),
                                         entity = HttpEntity(ProtobufMediaType, bytes),
-                                        headers = List(MesosStreamIdHeader(ctx.mesosStreamId.getOrElse(throw new IllegalStateException("MesosStreamId not set."))))))
-    }
+                                        headers = List(MesosStreamIdHeader(context.get().streamId.getOrElse(throw new IllegalStateException("MesosStreamId not set.")))))
+    )
 
-  private val callEnhancer: Flow[(ConnectionContext, Call), (ConnectionContext, Call), NotUsed] = Flow[(ConnectionContext, Call)]
-    .map { case (ctx, call) =>
-      (ctx, call.update(
-        _.optionalFrameworkId := Some(ctx.frameworkId.getOrElse(throw new IllegalStateException("FrameworkID not set"))))
+  private val callEnhancer: Flow[Call, Call, NotUsed] = Flow[Call]
+    .map { call =>
+      call.update(
+        _.optionalFrameworkId := Some(context.get().frameworkId.getOrElse(throw new IllegalStateException("FrameworkID not set")))
       )
     }
 
   private val sinkHub: RunnableGraph[Sink[Call, NotUsed]] =
     MergeHub.source[Call](perProducerBufferSize = 16)
-      .mapAsync(1)(event => contextPromise.future.map(ctx => (ctx, event)))
+      .mapAsync(1)(event => contextPromise.future.map(_ => event))
       .via(callEnhancer)
       .via(log("Sending "))
       .via(eventSerializer)
