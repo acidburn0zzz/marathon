@@ -158,7 +158,7 @@ class MesosClient(
     val subscribedHandler: Flow[Event, Event, NotUsed] = Flow[Event].map { event =>
       if (event.subscribed.isDefined) {
         val ctx = context.updateAndGet(c => c.copy(frameworkId = Some(event.subscribed.get.frameworkId)))
-        // We save `frameworkId` in the context and successfully complete the promise, meaning the calls in sink
+        // We save `frameworkId` in the context and successfully complete the promise, meaning the calls in sink can now be sent
         contextPromise.success(ctx)
       }
       event
@@ -191,8 +191,8 @@ class MesosClient(
 
 
   /**
-  Mesos sink is an akka-stream `Sink[Call, Notused]` that sends calls to mesos. Every call is send via a new (and pooled) connection.
-  The flow visualized:
+  Mesos sink is an akka-stream `Sink[Call, Notused]` that sends calls to mesos. Every call is sent via the same long-living
+  connection to mesos. This way we save resources and guarantee message order delivery. The flow visualized:
 
        |  |  |
        v  v  v
@@ -215,27 +215,54 @@ class MesosClient(
           v
      ------------
     | Request    |
-    | Builder    | (4)  <-- reads mesosStreamId and mesos url from connection context
+    | Builder    | (4)  <-- reads mesosStreamId and from connection context
      ------------
           |
           v
      ------------
-    | Http Sink  | (5)
+    | Http       |
+    | Connection | (5)  <-- reads mesos url from connection context
+     ------------
+          |
+          v
+     ------------
+    | Response   |
+    | Handler    | (6)
      ------------
 
     1. MergeHub allows dynamic "fan-in" junction point for mesos calls from multiple producers.
     2. Call Enhancer updates the call with the framework Id from the connection context
     3. Event Serializer serializes calls to byte array
     4. Build a HTTP request from the data using `mesosStreamId` header from the context
-    5. Http Sink creates a new connection using akka's `Http().singleRequest` and sends the data
+    5. Http connection uses akka's `Http().outgoingConnection` to sends the data to mesos. Note that all calls are sent
+       through one long-living connection.
+    6. Response handler will discard response entity or throw an exception on non-2xx response code
 
     Note: Merge hub will wait for the _connection context_ object to be fully initialized first meaning that we have current leader's
     `host`, `port` and `Mesos-Stream-Id` to send the events to.
     */
-  private val sink: Sink[HttpRequest, Future[Done]] = Sink.foreach[HttpRequest] { request =>
-      Http().singleRequest(request).map { response =>
-          logger.info(s"Response: $response")
-          response.discardEntityBytes()
+
+  // Initially `Http().singleRequest` was used to send calls. However when calls are fired at a high-speed rate,
+  // it might quickly overflow small http pool (the pool is shared for the entire actor system). Backpressure is not
+  // applied here.
+  //
+  // `Http().superPool()` or `Http.cachedHostConnectionPool()` are an alternative. However it may happen there that the requests
+  // sent could arrive at mesos out of sent order! The native scheduler driver guarantees that the events will be received by
+  // mesos in the same order they were sent.
+  //
+  // `Http().outgoingConnection` will create one long-living connection and use it to send events to mesos. Backpressure is applied
+  // automatically when mesos is slow and events are in order.
+  private val httpConnection: Flow[HttpRequest, HttpResponse, NotUsed] = Flow[HttpRequest]
+      .via(Http().outgoingConnection(context.get().host, context.get().port))
+
+  private val responseHandler: Sink[HttpResponse, Future[Done]] = Sink.foreach[HttpResponse] { response =>
+    response status match {
+      case status if status.isFailure() =>
+        logger.info(s"A request to mesos failed with response: ${response}")
+        throw new IllegalStateException(s"Failed to send a call to mesos")
+      case _ =>
+        logger.debug(s"Mesos call response: $response")
+        response.discardEntityBytes()
     }
   }
 
@@ -243,11 +270,10 @@ class MesosClient(
     .map(call => call.toByteArray)
 
   private val requestBuilder: Flow[Array[Byte], HttpRequest, NotUsed] = Flow[Array[Byte]]
-    .map(bytes => HttpRequest(
-                                        HttpMethods.POST,
-                                        uri = Uri(s"${context.get().url}/api/v1/scheduler"),
-                                        entity = HttpEntity(ProtobufMediaType, bytes),
-                                        headers = List(MesosStreamIdHeader(context.get().streamId.getOrElse(throw new IllegalStateException("MesosStreamId not set.")))))
+    .map(bytes => HttpRequest(HttpMethods.POST,
+                              uri = Uri(s"${context.get().url}/api/v1/scheduler"),
+                              entity = HttpEntity(ProtobufMediaType, bytes),
+                              headers = List(MesosStreamIdHeader(context.get().streamId.getOrElse(throw new IllegalStateException("MesosStreamId not set.")))))
     )
 
   private val callEnhancer: Flow[Call, Call, NotUsed] = Flow[Call]
@@ -264,7 +290,8 @@ class MesosClient(
       .via(log("Sending "))
       .via(eventSerializer)
       .via(requestBuilder)
-      .to(sink)
+      .via(httpConnection)
+      .to(responseHandler)
 
   // By running/materializing the consumer we get back a Sink, and hence now have access to feed elements into it.
   // This Sink can be materialized any number of times, and every element that enters the Sink will be consumed by
@@ -294,8 +321,8 @@ trait MesosApi {
   def mesosSource: Source[Event, NotUsed]
 
   /**
-    * Sink for mesos calls. Multiple publishers can materialize this sink to send mesos `Call`s. Every `Call` is sent
-    * using a new HTTP connection.
+    * Sink for mesos calls. Multiple publishers can materialize this sink to send mesos `Call`s. Every `Call` Every call is
+    * sent via one long-living connection to mesos.
     * Note: a scheduler can't send calls to mesos without subscribing first (see [MesosClient.source] method). Calls
     * published to sink without a successful subscription will be buffered and will have to wait for subscription
     * connection. Always call `source()` first.

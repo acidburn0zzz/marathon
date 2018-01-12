@@ -71,7 +71,7 @@ Mesos sink is an akka-stream `Sink[Call, Notused]` that sends calls to mesos. Ev
       v
  ------------
 | Call       |
-| Enhancer   | (2)
+| Enhancer   | (2)  <-- reads frameworkId from connection context
  ------------
      |
      v
@@ -83,19 +83,28 @@ Mesos sink is an akka-stream `Sink[Call, Notused]` that sends calls to mesos. Ev
       v
  ------------
 | Request    |
-| Builder    | (4)
+| Builder    | (4)   <-- reads mesosStreamId from connection context
  ------------
       |
       v
  ------------
-| Http Sink  | (5)
+| Http       |
+| Connection | (5)   <-- reads mesos url from connection context 
+ ------------
+      |
+      v
+ ------------
+| Response   |
+| Handler    | (6)
  ------------
 ```
 1. **MergeHub** allows dynamic "fan-in" junction point for mesos calls from multiple producers
 2. **Call Enhancer** updates the mesos call with the framework Id from the connection context
 3. **Event Serializer** serializes calls to byte array
 4. **Request Builder** builds a HTTP request from the data using `mesosStreamId` header from the context
-5. **Http Sink** creates a new connection using akka's `Http().singleRequest` and sends the data
+5. **Http connection** uses akka's `Http().outgoingConnection` to sends the data to mesos. Note that all calls are sent
+   through one long-living connection.
+6. **Response handler** will discard response entity or throw an exception on non-2xx response code
 
 Note: Merge hub will wait for the _connection context_ object to be fully initialized first meaning that we have current leader's `host`, `port` and `Mesos-Stream-Id` to send the events to.
 
@@ -115,8 +124,8 @@ trait MesosApi {
   def mesosSource: Source[Event, NotUsed]
 
   /**
-    * Sink for mesos calls. Multiple publishers can materialize this sink to send mesos `Call`s. Every `Call` is sent
-    * using a new HTTP connection.
+    * Sink for mesos calls. Multiple publishers can materialize this sink to send mesos `Call`s. Every `Call` Every call is
+    * sent via one long-living connection to mesos.
     */
   def mesosSink: Sink[Call, NotUsed]
 
